@@ -1,0 +1,32 @@
+[package]
+name = "rottnest_rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+
+default = ["flate2", "rust_backend"]
+
+rust_backend = ["flate2"]
+
+[dependencies]
+whatlang = "0.16.4"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.14"
+futures = "0.3"
+opendal = "0.45.0"
+anyhow = "1.0"
+# tantivy-tokenizer-api= "0.2.0"
+regex = "1.5"  # Check for the latest version
+arrow-array = "50.0.0"
+parquet = {version = "50.0.0", features = ["arrow", "async", "experimental", "test_common"]} 
+async-trait = "0.1.77"
+arrow-schema = "50.0.0"
+bytes = { version = "1.1", default-features = false, features = ["std"] }
+snap = { version = "1.0", default-features = false, optional = true }
+brotli = { version = "3.3", default-features = false, features = ["std"], optional = true }
+flate2 = { version = "1.0", default-features = true, features = ["rust_backend"], optional = true }
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"], optional = true }
+thrift = {version = "0.17.0"}
+arrow = "50.0.0"
+itertools = "0.12.1"
