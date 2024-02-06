@@ -1,6 +1,8 @@
+use arrow::datatypes::ToByteSlice;
 use opendal::services::Fs;
-use opendal::{services::S3, Operator};
-use opendal::Reader;
+use opendal::{services::S3, Operator, Reader};
+use opendal::raw::oio::ReadExt;
+
 use std::hash::Hash;
 use std::io::{self, Seek, SeekFrom, Read};
 use std::convert::TryFrom;
@@ -13,8 +15,7 @@ use parquet::compression::{create_codec, Codec, CodecOptionsBuilder};
 
 use parquet::errors::{ParquetError, Result};
 use parquet::file::{
-    reader::*,
-    statistics,
+    reader::*, statistics, FOOTER_SIZE
 };
 use parquet::format::{PageHeader, PageLocation, PageType};
 use bytes::Bytes;
@@ -22,9 +23,32 @@ use thrift::protocol::TCompactInputProtocol;
 use parquet::thrift::TSerializable;
 use parquet::arrow::array_reader::make_byte_array_reader;
 use parquet::util::{DataPageBuilder, DataPageBuilderImpl, InMemoryPageIterator};
-
+use parquet::file::footer::{decode_footer, decode_metadata};
+use parquet::file::metadata::ParquetMetaData;
 use arrow::error::ArrowError;
 
+async fn parse_metadata(reader: &mut Reader, file_size: usize) -> Result<ParquetMetaData> {
+    // check file is large enough to hold footer
+
+    let mut footer = [0_u8; 8];
+
+    reader.seek(SeekFrom::End(-8)).await.unwrap();
+    reader.read(&mut footer).await.unwrap();
+
+    let metadata_len = decode_footer(&footer)?;
+    let footer_metadata_len = FOOTER_SIZE + metadata_len;
+
+    if footer_metadata_len > file_size as usize {
+        return Err(ParquetError::General("Invalid Parquet file. Size is smaller than footer".to_string()));
+    }
+
+    let start = file_size as u64 - footer_metadata_len as u64;
+    let mut bytes = vec![0_u8; metadata_len];
+    reader.seek(SeekFrom::Start(start)).await.unwrap();
+    reader.read(&mut bytes).await.unwrap();
+
+    decode_metadata(bytes.to_byte_slice())
+}
 
 pub(crate) fn decode_page(
     page_header: PageHeader,
@@ -200,31 +224,9 @@ fn read_page_from_column_chunk_dict(
 use futures::stream::{self, StreamExt};
 use std::time::Duration;
 use tokio;
-use std::env;
+use std::{env, usize};
 use itertools::izip;
 use std::collections::HashMap;
-
-
-struct MyChunkReader(opendal::Reader); // Wrap opendal::Reader in a new struct
-
-impl ChunkReader for Bytes {
-    type T = bytes::buf::Reader<Bytes>;
-
-    fn get_read(&self, start: u64) -> Result<Self::T> {
-        let start = start as usize;
-        Ok(self.slice(start..).reader())
-    }
-
-    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
-        let start = start as usize;
-        Ok(self.slice(start..start + length))
-    }
-}
-
-async fn read_to_bytes() -> Bytes {
-
-}
-
 
 #[tokio::main]
 async fn read_pages_from_column_chunk(
@@ -239,88 +241,81 @@ async fn read_pages_from_column_chunk(
         .set_backward_compatible_lz4(false)
         .build();
     let mut builder = Fs::default();
-    let current_path = env::current_dir().expect("no path").to_str().expect("to string fail on path");
+    let current_path = env::current_dir().expect("no path");
+    let current_path = current_path.to_str().expect("to string fail on path");
     builder.root(current_path);
-    let mut operator = Operator::new(builder)?.finish();
+    let operator = Operator::new(builder)?.finish();
 
-    let mut readers: HashMap<&str, SerializedFileReader<Reader>> = HashMap::new();
-    for file_path in file_paths {
-        if ! readers.contains_key(file_path) {
-            let file1 = operator.reader(file_path).await?;
-            let reader = SerializedFileReader::new(file1)?;
-            readers.insert(file_path, reader);
+    let mut metadatas: HashMap<&str, ParquetMetaData> = HashMap::new();
+
+    for file_path in file_paths.iter() {
+        if ! metadatas.contains_key(file_path) {
+            let file_size: u64 = operator.stat(file_path).await?.content_length();
+            let mut reader: Reader = operator.clone().reader(file_path).await?;
+            metadatas.insert(file_path, parse_metadata(&mut reader, file_size as usize).await?);
         }
     }
 
-    stream::iter(izip!(file_paths, row_groups, page_offsets, page_sizes))
+    let stream = stream::iter(izip!(file_paths, row_groups, page_offsets, page_sizes))
         .map(
             |(file_path, row_group, page_offset, page_size)| 
             {
+                let column_descriptor = metadatas[file_path].row_group(row_group).schema_descr().column(column_index);
+                let compression_scheme = metadatas[file_path].row_group(row_group).column(column_index).compression();
+                let mut codec = create_codec(compression_scheme, &codec_options).unwrap().unwrap();
+                let my_operator = operator.clone();
                 async move {
-                    let file1 = operator.reader(file_path).await?;
-                    let reader = SerializedFileReader::new(file1)?;
-                    let metadata = reader.metadata();
-                    let column_descriptor = metadata.row_group(row_group).schema_descr().column(column_index);
-                    let compression_scheme = metadata.row_group(row_group).column(column_index).compression();
+                    let mut reader: Reader = my_operator.reader(file_path).await.unwrap();
+                    let mut page_bytes = vec![0; page_size];
+                    reader.seek(SeekFrom::Start(page_offset)).await.unwrap();
+                    reader.read(&mut page_bytes).await.unwrap();
+                    let page_bytes = Bytes::from(page_bytes);
+                    let (header_len, header) = read_page_header(&page_bytes, 0).unwrap();
+                    let page: Page = decode_page(header, page_bytes.slice(header_len .. page_size), Type::BYTE_ARRAY, Some(&mut codec)).unwrap();
+                    let num_values = page.num_values();
+                    let mut pages: Vec<Vec<parquet::column::page::Page>> = Vec::new();
+                    pages.push(vec![page]);
+                    let page_iterator = InMemoryPageIterator::new(pages);
+                    let mut array_reader = make_byte_array_reader(Box::new(page_iterator), column_descriptor.clone(), None).unwrap();
+                    let array = array_reader.next_batch( num_values as usize).unwrap();
 
-                 }
+                    let new_array = array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| ArrowError::ParseError("Expects string array as first argument".to_string())).unwrap();
+                    println!("{}", new_array.value(0))
+                    
+                }
             }
         )
-        .buffer_unordered(10)
-        .try_collect::<Vec<_>>()
-        .await()?;
+        .buffer_unordered(10);
 
-    // Open the Parquet file
-    let mut file = File::open(file_path)?;
+    let stream = tokio_stream::StreamExt::chunks_timeout(stream, 3, Duration::from_secs(20));
+
+    let _result: Vec<_> = stream.collect().await;
     
-    let (header_len, header) = read_page_header(&file ,page_offset)?;
-    // println!("{}, {:?}", header_len, header);
-    let start_position = page_offset + header_len as u64;
-    let end_position = page_offset + header_len as u64 + page_size as u64;
-    let mut buffer =  vec![0; (end_position - start_position) as usize];
-    file.seek(SeekFrom::Start(start_position))?;
-    file.read_exact(&mut buffer)?;
-
-    
-
-    let mut codec = create_codec(compression_scheme, &codec_options).unwrap().unwrap();
-    let page = decode_page(header, buffer.into(), Type::BYTE_ARRAY, Some(&mut codec))?;
-    let num_values = page.num_values();
-
-    let mut pages: Vec<Vec<parquet::column::page::Page>> = Vec::new();
-    pages.push(vec![page]);
-    let page_iterator = InMemoryPageIterator::new(pages);
-
-    let mut array_reader = make_byte_array_reader(Box::new(page_iterator), column_descriptor.clone(), None).unwrap();
-    let array = array_reader.next_batch( num_values as usize)?;
-
-    let array = array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ArrowError::ParseError("Expects string array as first argument".to_string())).unwrap();
-
-    println!("{}", array.value(0));
     Ok(())
 }
 
 fn main() {
-    let file_path = "part.parquet";
-    let column_index = 2; // Specify the column index
-    let page_offset =387765250 ; // Specify the offset of the page within the column chunk
-    let page_size = 138628; // Specify the size of the page to read
+    let file_path = vec!["train.parquet"];
+    let column_index = 0; // Specify the column index
+    let row_groups = vec![0, 0, 0];
+    let page_offset =vec![4, 317812, 770061] ; // Specify the offset of the page within the column chunk
+    let page_size = vec![317780 + 28, 452220 + 29, 368981 + 28]; // Specify the size of the page to read
 
-    if let Err(e) = read_page_from_column_chunk(file_path, 0, column_index, page_offset, page_size) {
+    if let Err(e) = read_pages_from_column_chunk(column_index, file_path, row_groups, page_offset, page_size) {
         eprintln!("Error reading page from column chunk: {}", e);
     }
 
-    let file_path = "test.parquet";
-    let column_index = 1;
-    let dict_page_offset = 1261899;
-    let dict_page_size = 19;
-    let page_offset = 1261931;
-    let page_size = 41683;
+    // let file_path = "test.parquet";
+    // let column_index = 1;
+    // let dict_page_offset = 1261899;
+    // let dict_page_size = 19;
+    // let page_offset = 1261931;
+    // let page_size = 41683;
 
-    if let Err(e) = read_page_from_column_chunk_dict(file_path, 0, column_index, dict_page_offset, dict_page_size, page_offset, page_size) {
-        eprintln!("Error reading page from column chunk: {}", e);
-    }
+    // if let Err(e) = read_page_from_column_chunk_dict(file_path, 0, column_index, dict_page_offset, dict_page_size, page_offset, page_size) {
+    //     eprintln!("Error reading page from column chunk: {}", e);
+    // }
 }
