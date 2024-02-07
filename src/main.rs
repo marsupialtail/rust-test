@@ -162,8 +162,54 @@ fn read_page_header<C: ChunkReader>(reader: &C, offset: u64) -> Result<(usize, P
     Ok((tracked.1, header))
 }
 
+enum ParquetOffsets {
+    TypeA(i32),
+    TypeB(String),
+}
+
+#[tokio::main]
+async fn get_parquet_layout(
+    operator: Operator,
+    column_index: usize,
+    file_path: &str
+) -> io::Result<()> {
+
+    let file_size: u64 = operator.stat(file_path).await?.content_length();
+    let mut reader: Reader = operator.clone().reader(file_path).await?;
+    let metadata = parse_metadata(&mut reader, file_size as usize).await?;
+    
+    for row_group in 0..metadata.num_row_groups() {
+        let column = metadata.row_group(row_group).column(column_index);
+        println!("{:?}", column.dictionary_page_offset());
+        let mut start = column
+            .dictionary_page_offset()
+            .unwrap_or_else(|| column.data_page_offset())
+            as u64;
+        let end = start + column.compressed_size() as u64;
+        println!("{} {}", start, end);
+        while start != end {
+            let mut dict_page_bytes = vec![0; 5];
+            reader.seek(SeekFrom::Start(start as u64)).await.unwrap();
+            reader.read(&mut dict_page_bytes).await.unwrap();
+            let (header_len, header) = read_page_header(&Bytes::from(dict_page_bytes), 0)?;
+            println!("{} {:?}", header_len, header);
+            if let Some(dictionary) = header.dictionary_page_header {
+                println!("0 {} {} {}", header.compressed_page_size, header.uncompressed_page_size, header_len);
+            } else if let Some(data_page) = header.data_page_header {
+                println!("1 {} {} {}", header.compressed_page_size, header.uncompressed_page_size, header_len);
+            } else if let Some(data_page) = header.data_page_header_v2 {
+                println!("2 {} {} {}", header.compressed_page_size, header.uncompressed_page_size, header_len);
+            }
+            start += header.compressed_page_size as u64 + header_len as u64;
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn read_pages_from_column_chunk(
+    operator: Operator,
     column_index: usize,
     file_paths: Vec<&str>,
     row_groups: Vec<usize>,
@@ -175,11 +221,6 @@ async fn read_pages_from_column_chunk(
     let codec_options = CodecOptionsBuilder::default()
         .set_backward_compatible_lz4(false)
         .build();
-    let mut builder = Fs::default();
-    let current_path = env::current_dir().expect("no path");
-    let current_path = current_path.to_str().expect("to string fail on path");
-    builder.root(current_path);
-    let operator = Operator::new(builder)?.finish();
 
     let mut metadatas: HashMap<&str, ParquetMetaData> = HashMap::new();
 
@@ -258,18 +299,17 @@ fn main() {
     let page_size = vec![317780 + 28, 452220 + 29, 368981 + 28, 21 + 22]; // Specify the size of the page to read
     let dict_page_size = vec![0,0,0, 19 + 14];
 
-    if let Err(e) = read_pages_from_column_chunk(column_index, file_path, row_groups, page_offset, page_size, dict_page_size) {
-        eprintln!("Error reading page from column chunk: {}", e);
-    }
+    let mut builder = Fs::default();
+    let current_path = env::current_dir().expect("no path");
+    let current_path = current_path.to_str().expect("to string fail on path");
+    builder.root(current_path);
+    let operator = Operator::new(builder).unwrap().finish();
 
-    // let file_path = "test.parquet";
-    // let column_index = 1;
-    // let dict_page_offset = 1261899;
-    // let dict_page_size = 19;
-    // let page_offset = 1261931;
-    // let page_size = 41683;
-
-    // if let Err(e) = read_page_from_column_chunk_dict(file_path, 0, column_index, dict_page_offset, dict_page_size, page_offset, page_size) {
+    // if let Err(e) = read_pages_from_column_chunk(operator.clone(), column_index, file_path, row_groups, page_offset, page_size, dict_page_size) {
     //     eprintln!("Error reading page from column chunk: {}", e);
     // }
+
+    let _ = get_parquet_layout(operator.clone(), column_index, "train.parquet");
+
+    
 }
