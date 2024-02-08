@@ -266,7 +266,7 @@ async fn read_pages_from_column_chunk(
     page_sizes: Vec<usize>,
     dict_page_sizes: Vec<usize>, // 0 means no dict page
 ) -> io::Result<()> {
-    let build = CodecOptionsBuilder::default()
+    let codec_options = CodecOptionsBuilder::default()
         .set_backward_compatible_lz4(false)
         .build();
 
